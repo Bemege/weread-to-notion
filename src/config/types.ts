@@ -52,6 +52,21 @@ export interface BookContentSyncResult {
 }
 
 /**
+ * 读书笔记写入类型
+ */
+export type ReadnoteType = "想法" | "摘要";
+
+export interface ReadnoteItem {
+  weid: string;
+  type: ReadnoteType;
+  content: string;
+  note?: string;
+  chapterTitle?: string;
+  createdAt?: number;
+  bookPageId: string;
+}
+
+/**
  * Notion内容块类型
  */
 export type NotionBlockType = "highlights" | "thoughts";

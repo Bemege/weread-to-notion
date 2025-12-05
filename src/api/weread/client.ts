@@ -279,6 +279,7 @@ export class WeReadClient {
             chapterTitle: chapterTitle,
             created: highlight.created,
             createdTime: timeStr,
+            bookmarkId: highlight.bookmarkId,
             style: highlight.style,
             colorStyle: highlight.colorStyle,
             range: highlight.range,

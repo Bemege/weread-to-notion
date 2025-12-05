@@ -27,6 +27,7 @@ async function main() {
     // 获取环境变量
     const NOTION_API_KEY = process.env.NOTION_INTEGRATIONS;
     const DATABASE_ID = process.env.DATABASE_ID;
+    const READNOTE_DATABASE_ID = process.env.READNOTE_DATABASE_ID;
     const CONFIG_DATABASE_ID = process.env.CONFIG_DATABASE_ID;
 
     // 验证必要的环境变量
@@ -37,6 +38,11 @@ async function main() {
 
     if (!DATABASE_ID) {
       console.error("错误: 缺少 DATABASE_ID 环境变量");
+      return;
+    }
+
+    if (!READNOTE_DATABASE_ID) {
+      console.error("错误: 缺少 READNOTE_DATABASE_ID 环境变量");
       return;
     }
 
@@ -89,13 +95,20 @@ async function main() {
         await syncAllBooksWithConfig(
           NOTION_API_KEY,
           DATABASE_ID,
+          READNOTE_DATABASE_ID,
           cookie,
           useIncremental,
           CONFIG_DATABASE_ID
         );
       } else {
         console.log("未配置CONFIG_DATABASE_ID，使用默认同步（所有书籍）");
-        await syncAllBooks(NOTION_API_KEY, DATABASE_ID, cookie, !fullSync);
+        await syncAllBooks(
+          NOTION_API_KEY,
+          DATABASE_ID,
+          READNOTE_DATABASE_ID,
+          cookie,
+          !fullSync
+        );
       }
     } else if (bookId) {
       // 同步单本书籍
@@ -116,7 +129,8 @@ async function main() {
         cookie,
         bookId,
         !fullSync,
-        organizeByChapter
+        organizeByChapter,
+        READNOTE_DATABASE_ID
       );
     } else {
       console.log(

@@ -3,7 +3,7 @@ name: WeRead to Notion Sync
 on:
   schedule:
     # 北京时间每天早上8点运行
-    - cron: "0 8 * * *"
+    - cron: "0 0 * * *"
   # 允许从Actions标签手动触发
   workflow_dispatch:
 
@@ -95,6 +95,7 @@ jobs:
           WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
           NOTION_INTEGRATIONS: ${{ secrets.NOTION_INTEGRATIONS }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
+          READNOTE_DATABASE_ID: ${{ secrets.READNOTE_DATABASE_ID }}
           NOTION_VERSION: ${{ secrets.NOTION_VERSION }}
           CONFIG_DATABASE_ID: ${{ secrets.CONFIG_DATABASE_ID }}
 

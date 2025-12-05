@@ -47,6 +47,20 @@ export interface BookInfo {
   isbn?: string;
   intro?: string;
   finishReading?: boolean;
+  rating?: number;
+  score?: number;
+  averageRating?: number;
+  wordCount?: number;
+  words?: number;
+  word_count?: number;
+  bookUrl?: string;
+  url?: string;
+  latestChapter?: string;
+  latestChapterTitle?: string;
+  myRating?: number;
+  userRating?: number;
+  link?: string;
+  summary?: string;
   [key: string]: any; // 其他可能的字段
 }
 
@@ -128,6 +142,7 @@ export interface FormattedHighlight {
   chapterTitle: string;
   created: number | string;
   createdTime: string;
+  bookmarkId?: string;
   style?: number;
   colorStyle?: number;
   range?: string;

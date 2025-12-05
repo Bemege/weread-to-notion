@@ -28,6 +28,7 @@ import { LibraryConfig } from "../../config/types";
 export async function syncAllBooksWithConfig(
   apiKey: string,
   databaseId: string,
+  readnoteDatabaseId: string,
   cookie: string,
   useIncremental: boolean = true,
   configDatabaseId?: string
@@ -105,7 +106,8 @@ export async function syncAllBooksWithConfig(
         apiKey,
         databaseId,
         book.title,
-        book.author
+        book.author,
+        book.bookId
       );
 
       let finalPageId: string;
@@ -124,9 +126,35 @@ export async function syncAllBooksWithConfig(
           // 优先使用详细API返回的信息
           isbn: detailedBookInfo?.isbn || book.isbn || "",
           publisher: detailedBookInfo?.publisher || book.publisher || "",
-          // 其他可能的详细信息也可以在这里添加
           intro: detailedBookInfo?.intro || book.intro || "",
           publishTime: detailedBookInfo?.publishTime || book.publishTime || "",
+          rating:
+            detailedBookInfo?.rating ||
+            detailedBookInfo?.score ||
+            book.rating ||
+            book.score ||
+            null,
+          averageRating:
+            detailedBookInfo?.averageRating || book.averageRating || null,
+          myRating: detailedBookInfo?.myRating || book.myRating || null,
+          wordCount:
+            detailedBookInfo?.wordCount ||
+            detailedBookInfo?.words ||
+            book.wordCount ||
+            book.words ||
+            null,
+          bookUrl:
+            detailedBookInfo?.bookUrl ||
+            detailedBookInfo?.url ||
+            book.bookUrl ||
+            book.url ||
+            "",
+          latestChapterTitle:
+            detailedBookInfo?.latestChapterTitle ||
+            detailedBookInfo?.latestChapter ||
+            book.latestChapterTitle ||
+            book.latestChapter ||
+            "",
         };
 
         console.log(
@@ -157,7 +185,8 @@ export async function syncAllBooksWithConfig(
         finalPageId,
         book,
         useIncrementalFromConfig,
-        organizeByChapterFromConfig
+        organizeByChapterFromConfig,
+        readnoteDatabaseId
       );
 
       // 检查是否有真正的更新

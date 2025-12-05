@@ -2,19 +2,24 @@
  * 书籍同步核心模块
  */
 
-import { BookContentSyncResult } from "../../config/types";
+import { BookContentSyncResult, ReadnoteItem, ReadnoteType } from "../../config/types";
 import { saveSyncState } from "../../utils/file";
 import {
   getBookHighlightsFormatted,
   getBookThoughtsFormatted,
 } from "../formatter";
+import { createHash } from "crypto";
 import {
-  writeHighlightsToNotionPage,
-  writeThoughtsToNotionPage,
+  writeReadnotesToDatabase,
   writeBookToNotion,
   checkBookExistsInNotion,
 } from "../../api/notion/services";
 import { getBookInfo } from "../../api/weread/services";
+import {
+  FormattedChapter,
+  FormattedHighlight,
+  FormattedThought,
+} from "../../api/weread/models";
 
 /**
  * 同步书籍内容（划线和想法）到Notion
@@ -28,7 +33,8 @@ export async function syncBookContent(
   finalPageId: string,
   bookInfo: any,
   useIncremental: boolean = true,
-  organizeByChapter: boolean = false
+  organizeByChapter: boolean = false,
+  readnoteDatabaseId?: string
 ): Promise<BookContentSyncResult> {
   console.log(`\n=== 同步书籍内容 ===`);
   console.log(`按章节组织: ${organizeByChapter ? "是" : "否"}`);
@@ -64,60 +70,52 @@ export async function syncBookContent(
       };
     }
 
-    // 1. 先处理划线数据
-    console.log(
-      `处理划线数据（共 ${highlights.reduce(
-        (sum, chapter) => sum + chapter.highlights.length,
-        0
-      )} 条）...`
-    );
-
-    let highlightResult = true;
-    if (hasHighlightUpdate && highlights.length > 0) {
-      // 写入划线数据
-      highlightResult = await writeHighlightsToNotionPage(
-        apiKey,
-        finalPageId,
-        bookInfo,
-        highlights,
-        organizeByChapter
+    if (!readnoteDatabaseId) {
+      throw new Error(
+        "缺少 READNOTE_DATABASE_ID，无法写入读书笔记数据库"
       );
-      console.log(
-        highlightResult
-          ? `成功写入 ${highlights.reduce(
-              (sum, chapter) => sum + chapter.highlights.length,
-              0
-            )} 条划线`
-          : `写入划线失败`
-      );
-    } else {
-      console.log(`没有新的划线需要同步`);
     }
 
-    // 2. 再处理想法数据
-    console.log(`处理想法数据（共 ${thoughts.length} 条）...`);
+    const readnoteEntries = buildReadnoteEntries(
+      bookInfo,
+      finalPageId,
+      highlights,
+      thoughts
+    );
 
-    let thoughtResult = true;
-    if (hasThoughtUpdate && thoughts.length > 0) {
-      // 写入想法数据 - 传递增量更新标志和按章节组织标志
-      thoughtResult = await writeThoughtsToNotionPage(
-        apiKey,
-        finalPageId,
-        bookInfo,
-        thoughts,
-        useIncremental,
-        organizeByChapter
-      );
+    if (readnoteEntries.length === 0) {
+      console.log("没有需要写入的读书笔记内容");
+    } else {
+      const thoughtCount = readnoteEntries.filter(
+        (entry) => entry.type === READNOTE_TYPE_THOUGHT
+      ).length;
+      const summaryCount = readnoteEntries.length - thoughtCount;
       console.log(
-        thoughtResult ? `成功写入 ${thoughts.length} 条想法` : `写入想法失败`
+        `准备写入 ${readnoteEntries.length} 条读书笔记（想法 ${thoughtCount} 条，摘要 ${summaryCount} 条）`
+      );
+    }
+
+    const readnoteResult =
+      readnoteEntries.length === 0
+        ? true
+        : await writeReadnotesToDatabase(
+            apiKey,
+            readnoteDatabaseId,
+            readnoteEntries,
+            bookInfo.title
+          );
+
+    if (readnoteResult) {
+      console.log(
+        `《${bookInfo.title}》的读书笔记同步完成（共 ${readnoteEntries.length} 条）`
       );
     } else {
-      console.log(`没有新的想法需要同步`);
+      console.warn(`《${bookInfo.title}》的读书笔记同步失败`);
     }
 
     // 返回同步结果和synckey
     return {
-      success: highlightResult && thoughtResult,
+      success: readnoteResult,
       highlightsSynckey,
       thoughtsSynckey,
       hasUpdate: true,
@@ -146,7 +144,8 @@ export async function syncSingleBook(
   cookie: string,
   bookId: string,
   useIncremental: boolean = true,
-  organizeByChapter: boolean = false
+  organizeByChapter: boolean = false,
+  readnoteDatabaseId?: string
 ): Promise<boolean> {
   console.log(
     `\n=== 开始${useIncremental ? "增量" : "全量"}同步书籍(ID: ${bookId}) ===`
@@ -168,7 +167,8 @@ export async function syncSingleBook(
       apiKey,
       databaseId,
       bookInfo.title,
-      bookInfo.author
+      bookInfo.author,
+      bookInfo.bookId
     );
 
     let finalPageId: string;
@@ -196,7 +196,8 @@ export async function syncSingleBook(
       finalPageId,
       bookInfo,
       useIncremental,
-      organizeByChapter
+      organizeByChapter,
+      readnoteDatabaseId
     );
 
     // 保存同步状态
@@ -219,4 +220,138 @@ export async function syncSingleBook(
     console.error(`同步书籍 ${bookId} 失败:`, error.message);
     return false;
   }
+}
+
+const READNOTE_TYPE_THOUGHT: ReadnoteType = "想法";
+const READNOTE_TYPE_SUMMARY: ReadnoteType = "摘要";
+
+function buildReadnoteEntries(
+  bookInfo: any,
+  bookPageId: string,
+  highlightChapters: FormattedChapter[],
+  thoughts: FormattedThought[]
+): ReadnoteItem[] {
+  const entries: ReadnoteItem[] = [];
+  const bookId = (bookInfo?.bookId || bookInfo?.id || "").toString();
+  const abstractKeySet = new Set<string>();
+  const seenWeids = new Set<string>();
+
+  const safeThoughts = Array.isArray(thoughts) ? thoughts : [];
+  safeThoughts.forEach((thought) => {
+    const abstractText = (thought.abstract || "").trim();
+    const noteText = (thought.content || "").trim();
+    const contentText = abstractText || noteText;
+
+    if (!contentText) {
+      return;
+    }
+
+    const weid =
+      (thought.reviewId && thought.reviewId.toString()) ||
+      generateFallbackWeid(bookId, "thought", contentText, thought.createTime);
+
+    if (seenWeids.has(weid)) {
+      return;
+    }
+    seenWeids.add(weid);
+
+    if (abstractText) {
+      abstractKeySet.add(generateContentKey(bookId, abstractText));
+    }
+
+    entries.push({
+      weid,
+      type: READNOTE_TYPE_THOUGHT,
+      content: contentText,
+      note: noteText || undefined,
+      chapterTitle: thought.chapterTitle || "未命名章节",
+      createdAt: ensureMilliseconds(thought.createTime),
+      bookPageId,
+    });
+  });
+
+  const flattenedHighlights = flattenHighlights(highlightChapters);
+  flattenedHighlights.forEach((highlight) => {
+    const text = (highlight.text || "").trim();
+    if (!text) {
+      return;
+    }
+
+    const contentKey = generateContentKey(bookId, text);
+    if (abstractKeySet.has(contentKey)) {
+      return;
+    }
+
+    const weid =
+      (highlight.bookmarkId && highlight.bookmarkId.toString()) ||
+      generateFallbackWeid(bookId, "highlight", text, highlight.created);
+
+    if (seenWeids.has(weid)) {
+      return;
+    }
+    seenWeids.add(weid);
+
+    entries.push({
+      weid,
+      type: READNOTE_TYPE_SUMMARY,
+      content: text,
+      chapterTitle: highlight.chapterTitle || "未命名章节",
+      createdAt: ensureMilliseconds(highlight.created),
+      bookPageId,
+    });
+  });
+
+  return entries;
+}
+
+function flattenHighlights(
+  chapters: FormattedChapter[] | undefined
+): FormattedHighlight[] {
+  if (!Array.isArray(chapters)) {
+    return [];
+  }
+
+  return chapters.reduce<FormattedHighlight[]>((acc, chapter) => {
+    if (chapter?.highlights?.length) {
+      acc.push(...chapter.highlights);
+    }
+    return acc;
+  }, []);
+}
+
+function generateContentKey(bookId: string, text: string): string {
+  if (!text) {
+    return `${bookId || "unknown"}::empty`;
+  }
+  return `${bookId || "unknown"}::${normalizeText(text)}`;
+}
+
+function normalizeText(text: string): string {
+  return text.replace(/\s+/g, "").toLowerCase();
+}
+
+function ensureMilliseconds(
+  timestamp: number | string | undefined
+): number | undefined {
+  if (timestamp === undefined || timestamp === null) {
+    return undefined;
+  }
+  const numericValue =
+    typeof timestamp === "number" ? timestamp : parseInt(timestamp, 10);
+  if (Number.isNaN(numericValue)) {
+    return undefined;
+  }
+  return numericValue > 9999999999 ? numericValue : numericValue * 1000;
+}
+
+function generateFallbackWeid(
+  bookId: string,
+  type: "thought" | "highlight",
+  text: string,
+  timestamp?: number | string
+): string {
+  const hash = createHash("md5")
+    .update(`${bookId || "unknown"}-${type}-${text}-${timestamp || ""}`)
+    .digest("hex");
+  return `${type}-${hash}`;
 }

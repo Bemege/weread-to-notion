@@ -4,7 +4,7 @@
 
 import axios, { AxiosError } from "axios";
 import { NOTION_API_BASE_URL, NOTION_VERSION } from "../../config/constants";
-import { NotionBlockType } from "../../config/types";
+import { NotionBlockType, ReadnoteItem } from "../../config/types";
 import { getNotionHeaders } from "../../utils/http";
 import {
   BookProperties,
@@ -64,22 +64,77 @@ export async function checkDatabaseProperties(
   }
 }
 
-/**
- * 格式化阅读时间，将秒数转换为可读格式
- * @param seconds 阅读时间秒数
- * @returns 格式化后的时间字符串
- */
-function formatReadingTime(seconds: number): string {
-  if (seconds <= 0) return "未阅读";
+function sanitizeRichText(value: string, maxLength = 1900): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  return trimmed.slice(0, maxLength);
+}
 
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
+function extractPrimaryAuthor(author?: string): string | null {
+  if (!author) return null;
+  const candidates = author
+    .split(/[,，/&、；;｜|]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return candidates.length > 0 ? candidates[0] : null;
+}
 
-  if (hours > 0) {
-    return `${hours}小时${minutes > 0 ? ` ${minutes}分钟` : ""}`;
-  } else {
-    return `${minutes}分钟`;
+function extractCategoryTags(category?: string): string[] {
+  if (!category) return [];
+  return category
+    .split(/[,，;；\\/|、]+/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+}
+
+function buildTitleProperty(content: string) {
+  const safeContent = content || "未命名书籍";
+  return {
+    title: [
+      {
+        type: "text",
+        text: {
+          content: safeContent,
+        },
+      },
+    ],
+  };
+}
+
+function buildRichTextProperty(content: string) {
+  if (!content) {
+    return { rich_text: [] };
   }
+  return {
+    rich_text: [
+      {
+        type: "text",
+        text: {
+          content,
+        },
+      },
+    ],
+  };
+}
+
+function buildCoverProperty(title: string, coverUrl?: string) {
+  if (!coverUrl) {
+    return {
+      files: [],
+    };
+  }
+  return {
+    files: [
+      {
+        type: "external",
+        name: `${title || "封面"}-封面`,
+        external: {
+          url: coverUrl,
+        },
+      },
+    ],
+  };
 }
 
 /**
@@ -89,7 +144,8 @@ export async function checkBookExistsInNotion(
   apiKey: string,
   databaseId: string,
   bookTitle: string,
-  bookAuthor: string
+  bookAuthor: string,
+  bookId?: string
 ): Promise<BookExistsResult> {
   try {
     console.log(`检查书籍《${bookTitle}》是否已存在于Notion数据库...`);
@@ -97,24 +153,52 @@ export async function checkBookExistsInNotion(
     // 设置请求头
     const headers = getNotionHeaders(apiKey, NOTION_VERSION);
 
-    // 构建查询 - 通过书名和作者来匹配
-    const queryData = {
-      filter: {
-        and: [
-          {
+    const normalizedAuthor = extractPrimaryAuthor(bookAuthor);
+
+    const titleAuthorFilter =
+      normalizedAuthor && normalizedAuthor.length > 0
+        ? {
+            and: [
+              {
+                property: "书名",
+                title: {
+                  contains: bookTitle,
+                },
+              },
+              {
+                property: "作者",
+                select: {
+                  equals: normalizedAuthor,
+                },
+              },
+            ],
+          }
+        : {
             property: "书名",
             title: {
               contains: bookTitle,
             },
-          },
+          };
+
+    let filter;
+    if (bookId) {
+      filter = {
+        or: [
           {
-            property: "作者",
+            property: "书籍ID",
             rich_text: {
-              contains: bookAuthor || "未知作者",
+              equals: bookId,
             },
           },
+          titleAuthorFilter,
         ],
-      },
+      };
+    } else {
+      filter = titleAuthorFilter;
+    }
+
+    const queryData = {
+      filter,
     };
 
     // 发送查询请求
@@ -155,169 +239,163 @@ export async function writeBookToNotion(
       apiKey,
       databaseId,
       bookData.title,
-      bookData.author || "未知作者"
+      bookData.author || "未知作者",
+      bookData.bookId || bookData.id
     );
-    if (existCheck.exists && existCheck.pageId) {
-      console.log(`书籍已存在，将使用现有页面: ${existCheck.pageId}`);
-      return { success: true, pageId: existCheck.pageId };
-    }
+    const existingPageId = existCheck.exists ? existCheck.pageId : undefined;
 
     // 设置请求头
     const headers = getNotionHeaders(apiKey, NOTION_VERSION);
 
-    // 从bookData中提取译者信息 (通常不在基本元数据中，可能需要单独处理)
-    const translator = bookData.translator || "";
+    const progressDetails = bookData.progressData || {};
+    const rawProgress =
+      progressDetails.progress ?? bookData.progress ?? 0;
+    const numericProgress =
+      toNumericValue(rawProgress) ?? 0;
+    const progressPercent = clampPercent(numericProgress / 100);
+    const startReadingISO = progressDetails.startReadingTime
+      ? new Date(progressDetails.startReadingTime * 1000).toISOString()
+      : null;
+    const lastReadingTimestamp =
+      progressDetails.updateTime ||
+      progressDetails.finishTime ||
+      null;
+    const rawReadingTime = toNumericValue(progressDetails.readingTime);
+    const readingTimeSeconds =
+      rawReadingTime && rawReadingTime > 0 ? rawReadingTime : 0;
+    const introText = sanitizeRichText(bookData.intro || "", 1900);
+    const latestChapter = sanitizeRichText(
+      progressDetails.summary ||
+        bookData.latestChapter ||
+        bookData.latestChapterTitle ||
+        "",
+      500
+    );
+    const bookLink =
+      bookData.bookUrl ||
+      bookData.url ||
+      bookData.link ||
+      (bookData.bookId
+        ? `https://weread.qq.com/web/bookDetail/${bookData.bookId}`
+        : null);
+    const authorOption = extractPrimaryAuthor(bookData.author);
+    const categoryTags = extractCategoryTags(bookData.category);
+    const startReadingSeconds = progressDetails.startReadingTime || null;
+    const canonicalLastReadSeconds =
+      lastReadingTimestamp ||
+      progressDetails.finishTime ||
+      startReadingSeconds ||
+      null;
+    const hasStarted =
+      Boolean(startReadingSeconds) || readingTimeSeconds > 0;
+    const readingDays =
+      hasStarted && startReadingSeconds && canonicalLastReadSeconds
+        ? Math.max(
+            1,
+            Math.ceil(
+              (canonicalLastReadSeconds - startReadingSeconds) /
+                (24 * 60 * 60)
+            )
+          )
+        : null;
+    const isFinished =
+      Boolean(bookData.finishReading) || progressPercent >= 99.5;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const THIRTY_DAYS = 30 * 24 * 60 * 60;
+    const isStalled =
+      hasStarted &&
+      !isFinished &&
+      canonicalLastReadSeconds !== null &&
+      nowSeconds - canonicalLastReadSeconds > THIRTY_DAYS;
+    let readingStatusName: "已读" | "未读" | "搁置" | "在读";
+    if (isFinished) {
+      readingStatusName = "已读";
+    } else if (!hasStarted) {
+      readingStatusName = "未读";
+    } else if (isStalled) {
+      readingStatusName = "搁置";
+    } else {
+      readingStatusName = "在读";
+    }
+    const lastReadingISO =
+      hasStarted && canonicalLastReadSeconds
+        ? new Date(canonicalLastReadSeconds * 1000).toISOString()
+        : null;
+    const effectiveReadingTimeSeconds =
+      readingStatusName === "未读" ? 0 : readingTimeSeconds;
 
-    // 构建要写入的数据
-    const data = {
+    const properties = {
+      书名: buildTitleProperty(bookData.title),
+      书籍ID: buildRichTextProperty(
+        (bookData.bookId || bookData.id || "").toString()
+      ),
+      ISBN: buildRichTextProperty(bookData.isbn || ""),
+      作者: {
+        select: authorOption ? { name: authorOption } : null,
+      },
+      分类: {
+        multi_select: categoryTags.map((tag) => ({ name: tag })),
+      },
+      封面: buildCoverProperty(bookData.title, bookData.cover),
+      开始阅读时间: {
+        date: startReadingISO ? { start: startReadingISO } : null,
+      },
+      最后阅读时间: {
+        date: lastReadingISO ? { start: lastReadingISO } : null,
+      },
+      简介: buildRichTextProperty(introText),
+      阅读进度: {
+        number: progressPercent,
+      },
+      阅读时长: {
+        number: effectiveReadingTimeSeconds,
+      },
+      阅读天数: {
+        number: readingDays ?? null,
+      },
+      链接: {
+        url: bookLink || null,
+      },
+      阅读状态: {
+        status: readingStatusName ? { name: readingStatusName } : null,
+      },
+      最新阅读章节: buildRichTextProperty(latestChapter),
+      出版社: buildRichTextProperty(bookData.publisher || ""),
+    };
+
+    // 如果页面已存在，执行更新
+    if (existingPageId) {
+      console.log(
+        `书籍已存在，更新页面属性: ${existingPageId}`
+      );
+      await axios.patch(
+        `${NOTION_API_BASE_URL}/pages/${existingPageId}`,
+        { properties },
+        { headers }
+      );
+      console.log(`书籍《${bookData.title}》的基础信息已刷新`);
+      return { success: true, pageId: existingPageId };
+    }
+
+    // 发送请求创建页面
+    const createPayload = {
       parent: {
         database_id: databaseId,
       },
-      properties: {
-        // 书名是title类型
-        书名: {
-          title: [
-            {
-              type: "text",
-              text: {
-                content: bookData.title,
-              },
-            },
-          ],
-        },
-        // 作者是rich_text类型
-        作者: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.author || "未知作者",
-              },
-            },
-          ],
-        },
-        // 译者是rich_text类型
-        译者: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: translator,
-              },
-            },
-          ],
-        },
-        // 类型是rich_text类型 - 修改为使用category字段
-        类型: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.category || "未知类型",
-              },
-            },
-          ],
-        },
-        // 封面是文件类型，但支持URL
-        封面: {
-          files: [
-            {
-              type: "external",
-              name: `${bookData.title}-封面`,
-              external: {
-                url: bookData.cover || "",
-              },
-            },
-          ],
-        },
-        // ISBN是rich_text类型
-        ISBN: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.isbn || "",
-              },
-            },
-          ],
-        },
-        // 出版社是rich_text类型
-        出版社: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.publisher || "",
-              },
-            },
-          ],
-        },
-        // 分类是rich_text类型
-        分类: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.category || "",
-              },
-            },
-          ],
-        },
-        // 阅读状态是select类型
-        阅读状态: {
-          select: {
-            name:
-              bookData.finishReadingStatus ||
-              (bookData.finishReading
-                ? "✅已读"
-                : bookData.progress && bookData.progress > 0
-                ? "📖在读"
-                : "📕未读"),
-          },
-        },
-        // 开始阅读日期 - 如果有startReadingTime则转换为可读日期
-        开始阅读: {
-          date: bookData.progressData?.startReadingTime
-            ? {
-                start: new Date(bookData.progressData.startReadingTime * 1000)
-                  .toISOString()
-                  .split("T")[0],
-              }
-            : null,
-        },
-        // 完成阅读日期 - 如果有finishTime则转换为可读日期
-        完成阅读: {
-          date: bookData.progressData?.finishTime
-            ? {
-                start: new Date(bookData.progressData.finishTime * 1000)
-                  .toISOString()
-                  .split("T")[0],
-              }
-            : null,
-        },
-        // 阅读总时长 - 转换为小时和分钟格式
-        阅读总时长: {
-          rich_text: [
-            {
-              type: "text",
-              text: {
-                content: bookData.progressData?.readingTime
-                  ? formatReadingTime(bookData.progressData.readingTime)
-                  : "未记录",
-              },
-            },
-          ],
-        },
-        // 阅读进度 - 数字类型，直接使用API返回的progress值
-        阅读进度: {
-          number: bookData.progressData?.progress || bookData.progress || 0,
-        },
+      icon: {
+        type: "emoji",
+        emoji: "📘",
       },
+      properties,
     };
-    // 发送请求创建页面
-    const response = await axios.post(`${NOTION_API_BASE_URL}/pages`, data, {
-      headers,
-    });
+
+    const response = await axios.post(
+      `${NOTION_API_BASE_URL}/pages`,
+      createPayload,
+      {
+        headers,
+      }
+    );
 
     console.log(`请求成功，响应状态码: ${response.status}`);
     console.log(`新创建页面ID: ${response.data.id}`);
@@ -668,6 +746,104 @@ export async function writeThoughtsToNotionPage(
 }
 
 /**
+ * 写入读书笔记到独立数据库
+ */
+export async function writeReadnotesToDatabase(
+  apiKey: string,
+  databaseId: string,
+  entries: ReadnoteItem[],
+  bookTitle?: string
+): Promise<boolean> {
+  if (!databaseId) {
+    console.error("未配置 READNOTE_DATABASE_ID，无法写入读书笔记");
+    return false;
+  }
+
+  if (!entries || entries.length === 0) {
+    console.log("没有新的读书笔记需要写入");
+    return true;
+  }
+
+  try {
+    const uniqueEntries = Array.from(
+      entries.reduce<Map<string, ReadnoteItem>>((map, entry) => {
+        if (!map.has(entry.weid)) {
+          map.set(entry.weid, entry);
+        }
+        return map;
+      }, new Map()).values()
+    );
+
+    const existingWeids = await fetchExistingReadnoteWeids(
+      apiKey,
+      databaseId,
+      uniqueEntries.map((entry) => entry.weid)
+    );
+
+    const pendingEntries = uniqueEntries.filter(
+      (entry) => !existingWeids.has(entry.weid)
+    );
+
+    if (pendingEntries.length === 0) {
+      console.log(
+        `${bookTitle ? `《${bookTitle}》` : "当前书籍"}的读书笔记无需写入（已存在）`
+      );
+      return true;
+    }
+
+    const headers = getNotionHeaders(apiKey, NOTION_VERSION);
+    let success = true;
+
+    let writtenCount = 0;
+
+    for (const chunk of chunkArray(pendingEntries, 10)) {
+      for (const entry of chunk) {
+        try {
+          const payload = {
+            parent: {
+              database_id: databaseId,
+            },
+            icon: {
+              type: "emoji",
+              emoji: "✏️",
+            },
+            properties: buildReadnoteProperties(entry),
+          };
+          await axios.post(`${NOTION_API_BASE_URL}/pages`, payload, {
+            headers,
+          });
+          writtenCount += 1;
+        } catch (error: unknown) {
+          success = false;
+          const axiosError = error as AxiosError;
+          console.error(
+            `写入读书笔记失败（WEID: ${entry.weid}）:`,
+            axiosError.message
+          );
+          if (axiosError.response) {
+            console.error(
+              "响应数据:",
+              JSON.stringify(axiosError.response.data, null, 2)
+            );
+          }
+        }
+      }
+    }
+
+    if (success) {
+      console.log(
+        `${bookTitle ? `《${bookTitle}》` : "当前书籍"}的读书笔记已写入 ${writtenCount} 条`
+      );
+    }
+
+    return success;
+  } catch (error: any) {
+    console.error("写入读书笔记数据库失败:", error.message);
+    return false;
+  }
+}
+
+/**
  * 批量添加Blocks到Notion
  */
 async function addBlocksToNotion(
@@ -833,3 +1009,157 @@ export async function deleteNotionBlocks(
     return false;
   }
 }
+
+async function fetchExistingReadnoteWeids(
+  apiKey: string,
+  databaseId: string,
+  weids: string[]
+): Promise<Set<string>> {
+  const cleanWeids = weids.filter((id) => !!id);
+  const existing = new Set<string>();
+
+  if (cleanWeids.length === 0) {
+    return existing;
+  }
+
+  const headers = getNotionHeaders(apiKey, NOTION_VERSION);
+  const chunkSize = 20;
+
+  for (const chunk of chunkArray(cleanWeids, chunkSize)) {
+    try {
+      const filter = {
+        or: chunk.map((weid) => ({
+          property: "WEID",
+          rich_text: {
+            equals: weid,
+          },
+        })),
+      };
+
+      const response = await axios.post(
+        `${NOTION_API_BASE_URL}/databases/${databaseId}/query`,
+        { filter },
+        { headers }
+      );
+
+      const results = response.data?.results || [];
+      results.forEach((page: any) => {
+        const richTexts = page?.properties?.WEID?.rich_text;
+        if (Array.isArray(richTexts) && richTexts.length > 0) {
+          const value = richTexts.map((item: any) => item.plain_text).join("");
+          if (value) {
+            existing.add(value);
+          }
+        }
+      });
+    } catch (error: unknown) {
+      const axiosError = error as AxiosError;
+      console.error("查询已存在读书笔记失败:", axiosError.message);
+    }
+  }
+
+  return existing;
+}
+
+function buildReadnoteProperties(entry: ReadnoteItem) {
+  const safeContent = (entry.content || "（未提供内容）").trim();
+  return {
+    内容: {
+      title: [
+        {
+          type: "text",
+          text: {
+            content: safeContent,
+          },
+        },
+      ],
+    },
+    笔记: {
+      rich_text: entry.note
+        ? [
+            {
+              type: "text",
+              text: {
+                content: entry.note,
+              },
+            },
+          ]
+        : [],
+    },
+    类型: {
+      select: {
+        name: entry.type,
+      },
+    },
+    章节标题: {
+      rich_text: entry.chapterTitle
+        ? [
+            {
+              type: "text",
+              text: {
+                content: entry.chapterTitle,
+              },
+            },
+          ]
+        : [],
+    },
+    创建时间: {
+      date: entry.createdAt
+        ? {
+            start: new Date(entry.createdAt).toISOString(),
+          }
+        : null,
+    },
+    书籍: {
+      relation: entry.bookPageId
+        ? [
+            {
+              id: entry.bookPageId,
+            },
+          ]
+        : [],
+    },
+    WEID: {
+      rich_text: [
+        {
+          type: "text",
+          text: {
+            content: entry.weid,
+          },
+        },
+      ],
+    },
+  };
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function clampPercent(value: number): number {
+  if (typeof value !== "number" || !isFinite(value)) {
+    return 0;
+  }
+  return Math.min(100, Math.max(0, Number(value.toFixed(2))));
+}
+
+function toNumericValue(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "number") {
+    return Number.isNaN(value) ? null : value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = parseFloat(trimmed.replace(/[^\d.-]/g, ""));
+    return Number.isNaN(numeric) ? null : numeric;
+  }
+  return null;
+}
+
